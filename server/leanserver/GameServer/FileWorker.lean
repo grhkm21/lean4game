@@ -18,17 +18,20 @@ private def mkEOI (pos : String.Pos) : Syntax :=
   let atom := mkAtom (SourceInfo.original "".toSubstring pos "".toSubstring pos) ""
   mkNode `Lean.Parser.Module.eoi #[atom]
 
-partial def parseTactic (inputCtx : InputContext) (pmctx : ParserModuleContext) (mps : ModuleParserState) (messages : MessageLog) (couldBeEndSnap : Bool) : Syntax × ModuleParserState × MessageLog := Id.run do
+partial def parseTactic (inputCtx : InputContext) (pmctx : ParserModuleContext)
+    (mps : ModuleParserState) (messages : MessageLog) (couldBeEndSnap : Bool) :
+    Syntax × ModuleParserState × MessageLog × String.Pos := Id.run do
   let mut pos := mps.pos
   let mut recovering := mps.recovering
   let mut messages := messages
   let mut stx := Syntax.missing  -- will always be assigned below
   if inputCtx.input.atEnd pos ∧ couldBeEndSnap then
     stx := mkEOI pos
-    return (stx, { pos, recovering }, messages)
+    return (stx, { pos, recovering }, messages, 0)
   let c := mkParserContext inputCtx pmctx
   let s := { cache := initCacheForInput c.input, pos := pos : ParserState }
   let s := whitespace c s
+  let endOfWhitespace := s.pos
   let s := (Tactic.sepByIndentSemicolon tacticParser).fn c s
   pos := s.pos
   match s.errorMsg with
@@ -41,7 +44,7 @@ partial def parseTactic (inputCtx : InputContext) (pmctx : ParserModuleContext) 
     stx := s.stxStack.back
     if ¬ c.input.atEnd s.pos then
       messages := messages.add <| mkErrorMessage c s.pos "end of input"
-  return (stx, { pos := c.input.endPos, recovering }, messages)
+  return (stx, { pos := c.input.endPos, recovering }, messages, endOfWhitespace)
 
 end MyModule
 
@@ -59,7 +62,7 @@ open JsonRpc
 section Elab
 
 open Lean.Elab Lean.Elab.Command in
-private def mkInfoTree (elaborator : Name) (stx : Syntax) (trees : PersistentArray InfoTree) : CommandElabM InfoTree := do
+private def mkCommandInfoTree (elaborator : Name) (stx : Syntax) (trees : PersistentArray InfoTree) : CommandElabM InfoTree := do
   let ctx ← read
   let s ← get
   let scope := s.scopes.head!
@@ -69,22 +72,15 @@ private def mkInfoTree (elaborator : Name) (stx : Syntax) (trees : PersistentArr
     openDecls := scope.openDecls, options := scope.opts, ngen := s.ngen
   } tree
 
-open Meta Lean.Elab Lean.Elab.Term in
-private def mkTacticMVar (type : Expr) (tacticCode : Syntax) : TermElabM Expr := do
-  let mvar ← mkFreshExprMVar type MetavarKind.syntheticOpaque
-  let mvarId := mvar.mvarId!
-  let ref ← getRef
-  registerSyntheticMVar ref mvarId <| SyntheticMVarKind.tactic tacticCode (← saveContext)
-  return mvar
-
 open Elab Elab.Term Elab.Tactic in
 /- `tacticStx` is expected to be a `Lean.Parser.Tactic.tacticSeq` -/
-partial def runTacticAux (goalStx : Syntax) (tacticStx : Syntax) : TermElabM Unit := do
-  let mvarId := (← Meta.mkFreshExprMVar none MetavarKind.syntheticOpaque).mvarId!
+partial def runTacticAux (tacticStx : Syntax) : TermElabM Unit := do
+  let mvarId := (← Meta.mkFreshExprMVar (← Term.elabTerm (← `(0 = 0)) none) MetavarKind.syntheticOpaque).mvarId!
   Elab.withInfoContext' (mkInfo := fun _ => pure $ Sum.inr mvarId) <| do
     withoutAutoBoundImplicit do
       instantiateMVarDeclMVars mvarId
       let remainingGoals ← withInfoHole mvarId <| Tactic.run mvarId do
+          withTacticInfoContext (mkNullNode #[]) (pure ())
           withTacticInfoContext tacticStx (evalTactic tacticStx)
           synthesizeSyntheticMVars (mayPostpone := false)
       unless remainingGoals.isEmpty do
@@ -94,11 +90,9 @@ partial def runTacticAux (goalStx : Syntax) (tacticStx : Syntax) : TermElabM Uni
 open Lean.Elab Lean.Elab.Command in
 partial def runTactic (goalStx : Syntax) (tacticStx : Syntax) : CommandElabM Unit := do
   withLogging <| withRef tacticStx <| withIncRecDepth <| withFreshMacroScope do
-    withInfoTreeContext (mkInfoTree := mkInfoTree `my_theorem tacticStx) <|
+    withInfoTreeContext (mkInfoTree := mkCommandInfoTree `my_theorem tacticStx) <|
       runTermElabM fun _ => Term.withDeclName `my_theorem do
-        let stx : Syntax ← (`(term| by {$(⟨tacticStx⟩)} ))
-        discard $ mkTacticMVar (← Term.elabTerm (← `(0 = 0)) none) stx
-        withRef tacticStx <| runTacticAux goalStx tacticStx
+        withRef tacticStx <| runTacticAux goalStx
         return ()
 
 -- TODO: Find a better way to pass on the file name?
@@ -114,7 +108,7 @@ def compileProof (inputCtx : Parser.InputContext) (snap : Snapshot) (hasWidgets 
   let cmdState := snap.cmdState
   let scope := cmdState.scopes.head!
   let pmctx := { env := cmdState.env, options := scope.opts, currNamespace := scope.currNamespace, openDecls := scope.openDecls }
-  let (tacticStx, cmdParserState, msgLog) :=
+  let (tacticStx, cmdParserState, msgLog, endOfWhitespace) :=
     MyModule.parseTactic inputCtx pmctx snap.mpState snap.msgLog couldBeEndSnap
   let cmdPos := tacticStx.getPos?.get!
   if Parser.isEOI tacticStx then
@@ -146,8 +140,9 @@ def compileProof (inputCtx : Parser.InputContext) (snap : Snapshot) (hasWidgets 
           -- TODO: make world and game configurable
           let some level ← getLevel? {game := `TestGame, world := `TestWorld, level := levelId}
             | throwServerError "Level not found"
+          let skip := Syntax.node (.original default 0 default endOfWhitespace) ``Lean.Parser.Tactic.skip #[]
           let done := Syntax.node (.synthetic cmdParserState.pos cmdParserState.pos) ``Lean.Parser.Tactic.done #[]
-          let tacticStx := (tacticStx.getArgs ++ #[done]).map (⟨.⟩)
+          let tacticStx := (#[skip] ++ tacticStx.getArgs ++ #[done]).map (⟨.⟩)
           let tacticStx := ← `(Lean.Parser.Tactic.tacticSeq| $[$(tacticStx)]*)
           -- Elab.Command.elabCommandTopLevel cmdStx
           runTactic tacticStx tacticStx
