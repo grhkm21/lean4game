@@ -45,6 +45,8 @@ partial def parseTactic (inputCtx : InputContext) (pmctx : ParserModuleContext) 
 
 end MyModule
 
+#check Lean.Elab.Command.CommandElabM
+
 namespace MyServer.FileWorker
 open Lean
 open Lean.Server
@@ -55,6 +57,49 @@ open Snapshots
 open JsonRpc
 
 section Elab
+
+open Lean.Elab Lean.Elab.Command in
+private def mkInfoTree (elaborator : Name) (stx : Syntax) (trees : PersistentArray InfoTree) : CommandElabM InfoTree := do
+  let ctx ← read
+  let s ← get
+  let scope := s.scopes.head!
+  let tree := InfoTree.node (Info.ofCommandInfo { elaborator, stx }) trees
+  return InfoTree.context {
+    env := s.env, fileMap := ctx.fileMap, mctx := {}, currNamespace := scope.currNamespace,
+    openDecls := scope.openDecls, options := scope.opts, ngen := s.ngen
+  } tree
+
+open Meta Lean.Elab Lean.Elab.Term in
+private def mkTacticMVar (type : Expr) (tacticCode : Syntax) : TermElabM Expr := do
+  let mvar ← mkFreshExprMVar type MetavarKind.syntheticOpaque
+  let mvarId := mvar.mvarId!
+  let ref ← getRef
+  registerSyntheticMVar ref mvarId <| SyntheticMVarKind.tactic tacticCode (← saveContext)
+  return mvar
+
+open Elab Elab.Term Elab.Tactic in
+/- `tacticStx` is expected to be a `Lean.Parser.Tactic.tacticSeq` -/
+partial def runTacticAux (goalStx : Syntax) (tacticStx : Syntax) : TermElabM Unit := do
+  let mvarId := (← Meta.mkFreshExprMVar none MetavarKind.syntheticOpaque).mvarId!
+  Elab.withInfoContext' (mkInfo := fun _ => pure $ Sum.inr mvarId) <| do
+    withoutAutoBoundImplicit do
+      instantiateMVarDeclMVars mvarId
+      let remainingGoals ← withInfoHole mvarId <| Tactic.run mvarId do
+          withTacticInfoContext tacticStx (evalTactic tacticStx)
+          synthesizeSyntheticMVars (mayPostpone := false)
+      unless remainingGoals.isEmpty do
+        reportUnsolvedGoals remainingGoals
+    modify fun s => { s with syntheticMVars := s.syntheticMVars.erase mvarId }
+
+open Lean.Elab Lean.Elab.Command in
+partial def runTactic (goalStx : Syntax) (tacticStx : Syntax) : CommandElabM Unit := do
+  withLogging <| withRef tacticStx <| withIncRecDepth <| withFreshMacroScope do
+    withInfoTreeContext (mkInfoTree := mkInfoTree `my_theorem tacticStx) <|
+      runTermElabM fun _ => Term.withDeclName `my_theorem do
+        let stx : Syntax ← (`(term| by {$(⟨tacticStx⟩)} ))
+        discard $ mkTacticMVar (← Term.elabTerm (← `(0 = 0)) none) stx
+        withRef tacticStx <| runTacticAux goalStx tacticStx
+        return ()
 
 -- TODO: Find a better way to pass on the file name?
 def levelIdFromFileName (fileName : String) : IO Nat := do
@@ -102,10 +147,11 @@ def compileProof (inputCtx : Parser.InputContext) (snap : Snapshot) (hasWidgets 
           let some level ← getLevel? {game := `TestGame, world := `TestWorld, level := levelId}
             | throwServerError "Level not found"
           let done := Syntax.node (.synthetic cmdParserState.pos cmdParserState.pos) ``Lean.Parser.Tactic.done #[]
-          let tacticStx := (tacticStx.getArgs.push done).map (⟨.⟩)
+          let tacticStx := (tacticStx.getArgs ++ #[done]).map (⟨.⟩)
           let tacticStx := ← `(Lean.Parser.Tactic.tacticSeq| $[$(tacticStx)]*)
-          let cmdStx ← `(command| theorem my_theorem $(level.goal) := by {$(⟨tacticStx⟩)} )
-          Elab.Command.elabCommandTopLevel cmdStx)
+          -- Elab.Command.elabCommandTopLevel cmdStx
+          runTactic tacticStx tacticStx
+          )
         cmdCtx cmdStateRef
     let postNew := (← tacticCacheNew.get).post
     snap.tacticCache.modify fun _ => { pre := postNew, post := {} }
