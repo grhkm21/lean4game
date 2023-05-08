@@ -17,3 +17,7 @@ export async function saveState(state: any) {
     // Ignore
   }
 }
+
+export function deleteStateFromStore() {
+  localStorage.setItem(KEY, "null");
+}
