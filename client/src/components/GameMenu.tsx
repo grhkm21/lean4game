@@ -19,16 +19,8 @@ function GameMenu() {
   const callDelete = () => {
     deleteStateFromStore()
 
-    // HERE: modify the state to delete `state.progress.level`
-
-
-    // export function deleteProgress (game: string) {
-    //   return (state) => {
-    //     state.progress = { level: {} } as ProgressState
-    //   }
-    // }
-
-    // deleteProgress(gameId)(store.getState())
+    // TODO: Instead, delete the state `progress`
+    window.location.reload()
 
     closeDeleteMenu()
   };
